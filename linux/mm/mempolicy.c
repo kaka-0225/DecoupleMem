@@ -3041,6 +3041,8 @@ bool htmm_skip_cooling = true;
 unsigned int htmm_thres_cooling_alloc =
 	256 * 1024 * 10; // unit: 4KiB, default: 10GB
 unsigned int ksampled_soft_cpu_quota = 30; // 3 %
+unsigned int htmm_ts_dram_ms = 160; /* TS DRAM phase length in ms */
+unsigned int htmm_ts_nvm_ms = 40; /* TS NVM phase length in ms */
 #endif
 
 #ifdef CONFIG_SYSFS
@@ -3607,10 +3609,58 @@ static struct kobj_attribute htmm_thres_cooling_alloc_attr =
 	__ATTR(htmm_thres_cooling_alloc, 0644, htmm_thres_cooling_alloc_show,
 	       htmm_thres_cooling_alloc_store);
 
+static ssize_t htmm_ts_dram_ms_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", htmm_ts_dram_ms);
+}
+
+static ssize_t htmm_ts_dram_ms_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	unsigned int v;
+	int err = kstrtouint(buf, 10, &v);
+	if (err)
+		return err;
+	if (v < 1 || v > 10000)
+		return -EINVAL;
+	WRITE_ONCE(htmm_ts_dram_ms, v);
+	return count;
+}
+
+static struct kobj_attribute htmm_ts_dram_ms_attr = __ATTR(
+	htmm_ts_dram_ms, 0644, htmm_ts_dram_ms_show, htmm_ts_dram_ms_store);
+
+static ssize_t htmm_ts_nvm_ms_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", htmm_ts_nvm_ms);
+}
+
+static ssize_t htmm_ts_nvm_ms_store(struct kobject *kobj,
+				    struct kobj_attribute *attr,
+				    const char *buf, size_t count)
+{
+	unsigned int v;
+	int err = kstrtouint(buf, 10, &v);
+	if (err)
+		return err;
+	if (v < 1 || v > 10000)
+		return -EINVAL;
+	WRITE_ONCE(htmm_ts_nvm_ms, v);
+	return count;
+}
+
+static struct kobj_attribute htmm_ts_nvm_ms_attr =
+	__ATTR(htmm_ts_nvm_ms, 0644, htmm_ts_nvm_ms_show, htmm_ts_nvm_ms_store);
+
 static struct attribute *htmm_attrs[] = {
 	&htmm_sample_period_attr.attr,
 	&htmm_inst_sample_period_attr.attr,
 	&htmm_split_period_attr.attr,
+	&htmm_ts_dram_ms_attr.attr,
+	&htmm_ts_nvm_ms_attr.attr,
 	&htmm_thres_hot_attr.attr,
 	&htmm_cooling_period_attr.attr,
 	&htmm_adaptation_period_attr.attr,

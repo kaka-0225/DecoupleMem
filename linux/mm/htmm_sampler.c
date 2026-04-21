@@ -8,6 +8,7 @@
 #include <linux/perf_event.h>
 #include <linux/delay.h>
 #include <linux/sched/cputime.h>
+#include <linux/workqueue.h>
 
 #include "../kernel/events/internal.h"
 
@@ -15,6 +16,30 @@
 
 struct task_struct *access_sampling = NULL;
 struct perf_event ***mem_event;
+
+/*
+ * ============ Phase 0: PEBS event time-slicing (TS) ============
+ * Alternate DRAMREAD / NVMREAD in time slices so that the two events
+ * do not contend for PMU counters / PEBS buffer / ksampled backend.
+ * MEMWRITE (STORE_ALL) stays enabled across both slices.
+ *
+ * Slice lengths are runtime-tunable via sysfs:
+ *   /sys/kernel/mm/htmm/htmm_ts_dram_ms (default 160)
+ *   /sys/kernel/mm/htmm/htmm_ts_nvm_ms  (default 40)
+ * (defined in mm/mempolicy.c)
+ */
+#define TS_ENABLE 1 /* compile-time switch, keep 1 for DecoupleMem */
+
+static struct delayed_work ts_switch_work;
+static bool ts_timer_running = false;
+static int ts_current_phase = 0; /* 0 = DRAM phase, 1 = NVM phase */
+
+/*
+ * File-scope sample_period index, shared between ksampled (which may
+ * update it under CPU-quota feedback) and ts_switch_work_fn (which
+ * reads it when re-arming DRAMREAD/NVMREAD after a slice switch).
+ */
+static unsigned long sample_period = 0;
 
 static bool valid_va(unsigned long addr)
 {
@@ -30,8 +55,15 @@ static __u64 get_pebs_event(enum events e)
 	case DRAMREAD:
 		return DRAM_LLC_LOAD_MISS;
 	case NVMREAD:
-		/* Always enable NVMREAD for both DRAM and NVM sampling */
-		return NVM_LLC_LOAD_MISS;
+		/*
+		 * In TS mode we always allocate the NVMREAD perf_event so that
+		 * ts_switch_work_fn can toggle it on/off at slice boundaries.
+		 * In CXL mode it is also always active.
+		 */
+		if (TS_ENABLE || htmm_cxl_mode)
+			return NVM_LLC_LOAD_MISS;
+		else
+			return N_HTMMEVENTS;
 	case MEMWRITE:
 		return ALL_STORES;
 	case CXLREAD:
@@ -171,6 +203,15 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 			switch (event) {
 			case DRAMREAD:
 			case NVMREAD:
+				/*
+				 * TS mode: only one of DRAMREAD/NVMREAD is enabled
+				 * at any given slice. perf_event_period() is safe to
+				 * call on the disabled event too; it will take
+				 * effect the next time the slice-switcher enables it.
+				 */
+				ret = perf_event_period(mem_event[cpu][event],
+							value);
+				break;
 			case CXLREAD:
 				ret = perf_event_period(mem_event[cpu][event],
 							value);
@@ -190,6 +231,101 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 	}
 }
 
+/*
+ * Enable one specific PEBS event at a given sample_period and leave
+ * the others untouched. Used by the TS slice switcher.
+ */
+static void ts_enable_event(enum events target_event, uint64_t period)
+{
+	int cpu;
+
+	for_each_online_cpu (cpu) {
+		if (mem_event[cpu][target_event]) {
+			perf_event_period(mem_event[cpu][target_event], period);
+			perf_event_enable(mem_event[cpu][target_event]);
+		}
+	}
+}
+
+static void ts_disable_event(enum events target_event)
+{
+	int cpu;
+
+	for_each_online_cpu (cpu) {
+		if (mem_event[cpu][target_event]) {
+			perf_event_disable(mem_event[cpu][target_event]);
+		}
+	}
+}
+
+/*
+ * Delayed-work handler that flips between the DRAM-only and NVM-only
+ * sampling slice. Re-arms itself at the end of each slice using the
+ * current sysfs-tunable slice length.
+ */
+static void ts_switch_work_fn(struct work_struct *work)
+{
+	unsigned long next_delay_ms;
+
+	if (!ts_timer_running)
+		return;
+
+	if (ts_current_phase == 0) {
+		/* DRAM slice ended -> enter NVM slice */
+		ts_current_phase = 1;
+		ts_disable_event(DRAMREAD);
+		ts_enable_event(NVMREAD, get_sample_period(sample_period));
+		next_delay_ms = READ_ONCE(htmm_ts_nvm_ms);
+		trace_printk(
+			"[TS] Switch to NVM-only phase: DRAM=OFF, NVM=%lu\n",
+			get_sample_period(sample_period));
+	} else {
+		/* NVM slice ended -> enter DRAM slice */
+		ts_current_phase = 0;
+		ts_disable_event(NVMREAD);
+		ts_enable_event(DRAMREAD, get_sample_period(sample_period));
+		next_delay_ms = READ_ONCE(htmm_ts_dram_ms);
+		trace_printk(
+			"[TS] Switch to DRAM-only phase: DRAM=%lu, NVM=OFF\n",
+			get_sample_period(sample_period));
+	}
+
+	schedule_delayed_work(&ts_switch_work, msecs_to_jiffies(next_delay_ms));
+}
+
+static void ts_timer_start(void)
+{
+	if (!TS_ENABLE || ts_timer_running)
+		return;
+
+	ts_timer_running = true;
+	ts_current_phase = 0; /* start with DRAM slice */
+
+	INIT_DELAYED_WORK(&ts_switch_work, ts_switch_work_fn);
+
+	/* Initial state: DRAM enabled, NVM disabled */
+	ts_enable_event(DRAMREAD, get_sample_period(0));
+	ts_disable_event(NVMREAD);
+
+	schedule_delayed_work(&ts_switch_work,
+			      msecs_to_jiffies(READ_ONCE(htmm_ts_dram_ms)));
+
+	printk("[TS] Time-sliced sampling started: dram=%ums, nvm=%ums, period=%lu\n",
+	       READ_ONCE(htmm_ts_dram_ms), READ_ONCE(htmm_ts_nvm_ms),
+	       get_sample_period(0));
+}
+
+static void ts_timer_stop(void)
+{
+	if (!ts_timer_running)
+		return;
+
+	ts_timer_running = false;
+	cancel_delayed_work_sync(&ts_switch_work);
+
+	printk("[TS] Time-sliced sampling stopped\n");
+}
+
 static int ksamplingd(void *data)
 {
 	unsigned long long nr_sampled = 0, nr_dram = 0, nr_nvm = 0,
@@ -204,7 +340,7 @@ static int ksamplingd(void *data)
 	unsigned long total_cputime, elapsed_cputime, cur;
 	/* used for periodic checks*/
 	unsigned long cpucap_period = msecs_to_jiffies(15000); // 15s
-	unsigned long sample_period = 0;
+	/* sample_period is now file-scope (shared with ts_switch_work_fn) */
 	unsigned long sample_inst_period = 0;
 	/* report cpu/period stat */
 	unsigned long trace_cputime,
@@ -470,11 +606,17 @@ int ksamplingd_init(pid_t pid, int node)
 		return 0;
 	}
 
+	/* Phase 0: arm the TS slice switcher */
+	ts_timer_start();
+
 	return ksamplingd_run();
 }
 
 void ksamplingd_exit(void)
 {
+	/* Phase 0: stop the TS slice switcher before tearing down PEBS */
+	ts_timer_stop();
+
 	if (access_sampling) {
 		kthread_stop(access_sampling);
 		access_sampling = NULL;
