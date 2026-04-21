@@ -1,0 +1,41 @@
+# Kernel build artifacts
+linux/.config
+linux/.config.old
+linux/.version
+linux/vmlinux
+linux/vmlinux.o
+linux/vmlinux.symvers
+linux/vmlinux-gdb.py
+linux/System.map
+linux/Module.symvers
+linux/modules-only.symvers
+linux/modules.order
+linux/modules.builtin*
+linux/*.symtypes
+linux/.tmp_*
+linux/.tmp_versions/
+linux/include/config/
+linux/include/generated/
+linux/arch/*/include/generated/
+linux/arch/*/boot/bzImage
+linux/arch/*/boot/zImage
+linux/arch/*/boot/*.bin
+
+# Object files / build traces
+*.o
+*.o.*
+*.a
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+.*.d
+*.dwo
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
