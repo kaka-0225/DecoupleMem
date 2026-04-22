@@ -139,6 +139,7 @@ enum vm_event_item {
 	HTMM_NR_SAMPLED,
 	HTMM_NR_DRAM_SAMPLED,
 	HTMM_NR_NVM_SAMPLED,
+	HTMM_NR_STALE_DROPPED, /* Phase 1.A: cross-tier stale samples filtered out */
 	HTMM_MISSED_DRAMREAD,
 	HTMM_MISSED_NVMREAD,
 	HTMM_MISSED_WRITE,

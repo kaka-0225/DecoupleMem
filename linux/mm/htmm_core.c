@@ -210,6 +210,17 @@ void check_transhuge_cooling(void *arg, struct page *page, bool locked)
 		cur_idx = meta_page->total_accesses;
 		cur_idx = get_idx(cur_idx);
 		memcg->hotness_hg[cur_idx] += HPAGE_PMD_NR;
+		/* Phase 1.B: 镜像维护双 hist (THP cooling rebuild) */
+		{
+			bool on_dram =
+				htmm_cxl_mode ?
+					(page_to_nid(page) == 0) :
+					node_is_toptier(page_to_nid(page));
+			if (on_dram)
+				memcg->dram_hotness_hg[cur_idx] += HPAGE_PMD_NR;
+			else
+				memcg->nvm_hotness_hg[cur_idx] += HPAGE_PMD_NR;
+		}
 		meta_page->idx = cur_idx;
 
 		/* updates skewness */
@@ -271,6 +282,17 @@ void check_base_cooling(pginfo_t *pginfo, struct page *page, bool locked)
 		cur_idx = get_idx(pginfo->total_accesses);
 		memcg->hotness_hg[cur_idx]++;
 		memcg->ebp_hotness_hg[cur_idx]++;
+		/* Phase 1.B: 镜像维护双 hist (base page lazy cooling rebuild) */
+		{
+			bool on_dram =
+				htmm_cxl_mode ?
+					(page_to_nid(page) == 0) :
+					node_is_toptier(page_to_nid(page));
+			if (on_dram)
+				memcg->dram_hotness_hg[cur_idx]++;
+			else
+				memcg->nvm_hotness_hg[cur_idx]++;
+		}
 
 		pginfo->cooling_clock = memcg_cclock;
 	} else
@@ -385,6 +407,17 @@ void check_failed_list(struct mem_cgroup_per_node *pn, struct list_head *tmp,
 
 		spin_lock(&memcg->access_lock);
 		memcg->hotness_hg[idx] += HPAGE_PMD_NR;
+		/* Phase 1.B: 镜像维护双 hist (failed-split THP add-back) */
+		{
+			bool on_dram =
+				htmm_cxl_mode ?
+					(page_to_nid(page) == 0) :
+					node_is_toptier(page_to_nid(page));
+			if (on_dram)
+				memcg->dram_hotness_hg[idx] += HPAGE_PMD_NR;
+			else
+				memcg->nvm_hotness_hg[idx] += HPAGE_PMD_NR;
+		}
 		spin_unlock(&memcg->access_lock);
 	}
 }
@@ -645,6 +678,19 @@ void uncharge_htmm_page(struct page *page, struct mem_cgroup *memcg)
 			memcg->hotness_hg[idx] -= nr_pages;
 		else
 			memcg->hotness_hg[idx] = 0;
+		/* Phase 1.B: 镜像维护双 hist (THP uncharge) */
+		{
+			bool on_dram =
+				htmm_cxl_mode ?
+					(page_to_nid(page) == 0) :
+					node_is_toptier(page_to_nid(page));
+			unsigned long *hg = on_dram ? memcg->dram_hotness_hg :
+						      memcg->nvm_hotness_hg;
+			if (hg[idx] >= nr_pages)
+				hg[idx] -= nr_pages;
+			else
+				hg[idx] = 0;
+		}
 
 		for (i = 0; i < HPAGE_PMD_NR; i++) {
 			int base_idx = 4 + i / 4;
@@ -857,7 +903,7 @@ lru_unlock:
 }
 
 static void update_base_page(struct vm_area_struct *vma, struct page *page,
-			     pginfo_t *pginfo)
+			     pginfo_t *pginfo, enum events e)
 {
 	struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
 	unsigned long prev_accessed, prev_idx, cur_idx;
@@ -865,6 +911,20 @@ static void update_base_page(struct vm_area_struct *vma, struct page *page,
 
 	/* check cooling status and perform cooling if the page needs to be cooled */
 	check_base_cooling(pginfo, page, false);
+
+	/* Phase 1.A: drop cross-tier stale samples.
+	 * MEMWRITE / CXLREAD / TLB_MISS_* fall through and are accounted as before.
+	 */
+	{
+		bool on_dram = htmm_cxl_mode ?
+				       (page_to_nid(page) == 0) :
+				       node_is_toptier(page_to_nid(page));
+
+		if ((e == DRAMREAD && !on_dram) || (e == NVMREAD && on_dram)) {
+			count_vm_event(HTMM_NR_STALE_DROPPED);
+			return;
+		}
+	}
 
 	prev_accessed = pginfo->total_accesses;
 	pginfo->nr_accesses++;
@@ -883,6 +943,19 @@ static void update_base_page(struct vm_area_struct *vma, struct page *page,
 		if (memcg->ebp_hotness_hg[prev_idx] > 0)
 			memcg->ebp_hotness_hg[prev_idx]--;
 		memcg->ebp_hotness_hg[cur_idx]++;
+
+		/* Phase 1.B: 镜像维护双 hist (base-page sample, post-1.A filter) */
+		{
+			bool on_dram =
+				htmm_cxl_mode ?
+					(page_to_nid(page) == 0) :
+					node_is_toptier(page_to_nid(page));
+			unsigned long *hg = on_dram ? memcg->dram_hotness_hg :
+						      memcg->nvm_hotness_hg;
+			if (hg[prev_idx] > 0)
+				hg[prev_idx]--;
+			hg[cur_idx]++;
+		}
 	}
 
 	if (pginfo->may_hot == true)
@@ -908,7 +981,8 @@ static void update_base_page(struct vm_area_struct *vma, struct page *page,
 }
 
 static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
-			     struct page *page, unsigned long address)
+			     struct page *page, unsigned long address,
+			     enum events e)
 {
 	struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
 	struct page *meta_page;
@@ -922,6 +996,18 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 
 	/* check cooling status */
 	check_transhuge_cooling((void *)memcg, page, false);
+
+	/* Phase 1.A: drop cross-tier stale samples (same as base page). */
+	{
+		bool on_dram = htmm_cxl_mode ?
+				       (page_to_nid(page) == 0) :
+				       node_is_toptier(page_to_nid(page));
+
+		if ((e == DRAMREAD && !on_dram) || (e == NVMREAD && on_dram)) {
+			count_vm_event(HTMM_NR_STALE_DROPPED);
+			return;
+		}
+	}
 
 	pginfo_prev = pginfo->total_accesses;
 	pginfo->nr_accesses++;
@@ -964,6 +1050,21 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 			memcg->hotness_hg[prev_idx] = 0;
 
 		memcg->hotness_hg[cur_idx] += HPAGE_PMD_NR;
+
+		/* Phase 1.B: 镜像维护双 hist (THP sample, post-1.A filter) */
+		{
+			bool on_dram =
+				htmm_cxl_mode ?
+					(page_to_nid(page) == 0) :
+					node_is_toptier(page_to_nid(page));
+			unsigned long *hg = on_dram ? memcg->dram_hotness_hg :
+						      memcg->nvm_hotness_hg;
+			if (hg[prev_idx] >= HPAGE_PMD_NR)
+				hg[prev_idx] -= HPAGE_PMD_NR;
+			else
+				hg[prev_idx] = 0;
+			hg[cur_idx] += HPAGE_PMD_NR;
+		}
 		spin_unlock(&memcg->access_lock);
 	}
 	meta_page->idx = cur_idx;
@@ -985,7 +1086,7 @@ static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 }
 
 static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
-			       unsigned long address)
+			       unsigned long address, enum events e)
 {
 	pte_t *pte, ptent;
 	spinlock_t *ptl;
@@ -1013,7 +1114,7 @@ static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
 	if (!pginfo)
 		goto pte_unlock;
 
-	update_base_page(vma, page, pginfo);
+	update_base_page(vma, page, pginfo, e);
 	pte_unmap_unlock(pte, ptl);
 	if (htmm_cxl_mode) {
 		if (page_to_nid(page) == 0)
@@ -1033,7 +1134,7 @@ pte_unlock:
 }
 
 static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
-			       unsigned long address)
+			       unsigned long address, enum events e)
 {
 	pmd_t *pmd, pmdval;
 	bool ret = 0;
@@ -1066,7 +1167,7 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 			goto pmd_unlock;
 		}
 
-		update_huge_page(vma, pmd, page, address);
+		update_huge_page(vma, pmd, page, address, e);
 		if (htmm_cxl_mode) {
 			if (page_to_nid(page) == 0)
 				return 1;
@@ -1083,10 +1184,11 @@ static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
 	}
 
 	/* base page */
-	return __update_pte_pginfo(vma, pmd, address);
+	return __update_pte_pginfo(vma, pmd, address, e);
 }
 
-static int __update_pginfo(struct vm_area_struct *vma, unsigned long address)
+static int __update_pginfo(struct vm_area_struct *vma, unsigned long address,
+			   enum events e)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
@@ -1104,7 +1206,7 @@ static int __update_pginfo(struct vm_area_struct *vma, unsigned long address)
 	if (pud_none_or_clear_bad(pud))
 		return 0;
 
-	return __update_pmd_pginfo(vma, pud, address);
+	return __update_pmd_pginfo(vma, pud, address, e);
 }
 
 static void set_memcg_split_thres(struct mem_cgroup *memcg)
@@ -1189,6 +1291,9 @@ static void reset_memcg_stat(struct mem_cgroup *memcg)
 	for (i = 0; i < 16; i++) {
 		memcg->hotness_hg[i] = 0;
 		memcg->ebp_hotness_hg[i] = 0;
+		/* Phase 1.B: 同步清零双 hist (整轮 cooling 重建) */
+		memcg->dram_hotness_hg[i] = 0;
+		memcg->nvm_hotness_hg[i] = 0;
 	}
 
 	for (i = 0; i < 21; i++)
@@ -1208,6 +1313,9 @@ static bool __cooling(struct mm_struct *mm, struct mem_cgroup *memcg)
 		if (pn && READ_ONCE(pn->need_cooling)) {
 			spin_lock(&memcg->access_lock);
 			memcg->cooling_clock++;
+			/* Phase 1.B: 双 clock Phase 1 同步推进 */
+			memcg->dram_cooling_clock++;
+			memcg->nvm_cooling_clock++;
 			spin_unlock(&memcg->access_lock);
 			return false;
 		}
@@ -1217,6 +1325,9 @@ static bool __cooling(struct mm_struct *mm, struct mem_cgroup *memcg)
 
 	reset_memcg_stat(memcg);
 	memcg->cooling_clock++;
+	/* Phase 1.B: 双 clock Phase 1 同步推进 */
+	memcg->dram_cooling_clock++;
+	memcg->nvm_cooling_clock++;
 	memcg->bp_active_threshold--;
 	memcg->cooled = true;
 	smp_mb();
@@ -1229,6 +1340,35 @@ static bool __cooling(struct mm_struct *mm, struct mem_cgroup *memcg)
 	spin_unlock(&memcg->access_lock);
 	set_lru_cooling(mm);
 	return true;
+}
+
+/* Phase 1.B: 仅基于 DRAM 侧 hist + max_nr_dram_pages 反推 dram_active_threshold。
+ * 算法完全复刻 __adjust_active_threshold 的"从 bucket 15 往下累计"逻辑。
+ * 1.B 阶段仅维护，决策路径不读，供 sysfs htmm_dump_dual 检视。
+ */
+static void __adjust_dram_active_threshold(struct mem_cgroup *memcg)
+{
+	unsigned long nr_active = 0;
+	unsigned long max_nr_pages =
+		memcg->max_nr_dram_pages -
+		get_memcg_promotion_watermark(memcg->max_nr_dram_pages);
+	int idx_hot;
+
+	spin_lock(&memcg->access_lock);
+	for (idx_hot = 15; idx_hot >= 0; idx_hot--) {
+		unsigned long nr_pages = memcg->dram_hotness_hg[idx_hot];
+		if (nr_active + nr_pages > max_nr_pages)
+			break;
+		nr_active += nr_pages;
+	}
+	if (idx_hot != 15)
+		idx_hot++;
+	spin_unlock(&memcg->access_lock);
+
+	if (idx_hot < htmm_thres_hot)
+		idx_hot = htmm_thres_hot;
+
+	memcg->dram_active_threshold = idx_hot;
 }
 
 static void __adjust_active_threshold(struct mm_struct *mm,
@@ -1388,7 +1528,7 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e)
 		goto mmap_unlock;
 
 	/* increase sample counts only for valid records */
-	ret = __update_pginfo(vma, address);
+	ret = __update_pginfo(vma, address, e);
 	if (ret == 1) { /* memory accesses to DRAM */
 		memcg->nr_sampled++;
 		memcg->nr_sampled_for_split++;
@@ -1468,6 +1608,7 @@ void update_pginfo(pid_t pid, unsigned long address, enum events e)
 	/* threshold adaptation */
 	else if (memcg->nr_sampled % htmm_adaptation_period == 0) {
 		__adjust_active_threshold(mm, memcg);
+		__adjust_dram_active_threshold(memcg);
 	}
 
 mmap_unlock:

@@ -1384,6 +1384,7 @@ const char *const vmstat_text[] = {
 	"htmm_nr_sampled",
 	"htmm_nr_dram_sampled",
 	"htmm_nr_nvm_sampled",
+	"htmm_nr_stale_dropped",
 	"htmm_missed_dramread",
 	"htmm_missed_nvmread",
 	"htmm_missed_write",

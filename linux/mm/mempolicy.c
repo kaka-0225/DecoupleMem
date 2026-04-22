@@ -104,6 +104,7 @@
 #include <linux/swapops.h>
 #ifdef CONFIG_HTMM
 #include <linux/htmm.h>
+#include <linux/memcontrol.h> /* Phase 1.B: root_mem_cgroup */
 #endif
 
 #include <asm/tlbflush.h>
@@ -3655,6 +3656,68 @@ static ssize_t htmm_ts_nvm_ms_store(struct kobject *kobj,
 static struct kobj_attribute htmm_ts_nvm_ms_attr =
 	__ATTR(htmm_ts_nvm_ms, 0644, htmm_ts_nvm_ms_show, htmm_ts_nvm_ms_store);
 
+/* Phase 1.B: 只读 dump 第一个 htmm_enabled 的 memcg 的 DRAM/NVM 双 hist
+ * + dram_active_threshold + 双 cooling_clock。
+ * 实验场景下工作负载跑在 child cgroup，root_mem_cgroup 不开 htmm。
+ */
+static ssize_t htmm_dump_dual_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	struct mem_cgroup *iter, *memcg = NULL;
+	int i, len = 0;
+	unsigned long dsum = 0, nsum = 0, hsum = 0;
+
+	for (iter = mem_cgroup_iter(NULL, NULL, NULL); iter != NULL;
+	     iter = mem_cgroup_iter(NULL, iter, NULL)) {
+		if (iter->htmm_enabled) {
+			memcg = iter;
+			mem_cgroup_iter_break(NULL, iter);
+			break;
+		}
+	}
+
+	if (!memcg)
+		return sysfs_emit(buf, "(no htmm_enabled memcg found)\n");
+
+	spin_lock(&memcg->access_lock);
+	for (i = 0; i < 16; i++) {
+		dsum += memcg->dram_hotness_hg[i];
+		nsum += memcg->nvm_hotness_hg[i];
+		hsum += memcg->hotness_hg[i];
+	}
+	len += scnprintf(
+		buf + len, PAGE_SIZE - len,
+		"dram_active_threshold=%u  active_threshold=%u  bp_active_threshold=%u  warm_threshold=%u\n",
+		memcg->dram_active_threshold, memcg->active_threshold,
+		memcg->bp_active_threshold, memcg->warm_threshold);
+	len += scnprintf(
+		buf + len, PAGE_SIZE - len,
+		"cooling_clock: total=%u dram=%u nvm=%u  max_nr_dram_pages=%lu\n",
+		memcg->cooling_clock, memcg->dram_cooling_clock,
+		memcg->nvm_cooling_clock, memcg->max_nr_dram_pages);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "hotness_hg sum=%lu :", hsum);
+	for (i = 0; i < 16; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, " %lu",
+				 memcg->hotness_hg[i]);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "\ndram_hg    sum=%lu :", dsum);
+	for (i = 0; i < 16; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, " %lu",
+				 memcg->dram_hotness_hg[i]);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "\nnvm_hg     sum=%lu :", nsum);
+	for (i = 0; i < 16; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, " %lu",
+				 memcg->nvm_hotness_hg[i]);
+	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	spin_unlock(&memcg->access_lock);
+	return len;
+}
+
+static struct kobj_attribute htmm_dump_dual_attr =
+	__ATTR(htmm_dump_dual, 0444, htmm_dump_dual_show, NULL);
+
 static struct attribute *htmm_attrs[] = {
 	&htmm_sample_period_attr.attr,
 	&htmm_inst_sample_period_attr.attr,
@@ -3677,6 +3740,7 @@ static struct attribute *htmm_attrs[] = {
 	&htmm_cxl_mode_attr.attr,
 	&htmm_skip_cooling_attr.attr,
 	&htmm_thres_cooling_alloc_attr.attr,
+	&htmm_dump_dual_attr.attr,
 	NULL,
 };
 
