@@ -206,6 +206,7 @@ extern unsigned int htmm_thres_cooling_alloc;
 extern unsigned int ksampled_soft_cpu_quota;
 extern unsigned int htmm_ts_dram_ms;
 extern unsigned int htmm_ts_nvm_ms;
+extern unsigned int htmm_dual_decision; /* Phase 1.C */
 #endif
 static inline bool mpol_is_preferred_many(struct mempolicy *pol)
 {

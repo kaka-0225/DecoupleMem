@@ -3044,6 +3044,11 @@ unsigned int htmm_thres_cooling_alloc =
 unsigned int ksampled_soft_cpu_quota = 30; // 3 %
 unsigned int htmm_ts_dram_ms = 160; /* TS DRAM phase length in ms */
 unsigned int htmm_ts_nvm_ms = 40; /* TS NVM phase length in ms */
+/* Phase 1.C: A/B switch for new dual-decision logic
+ * 1 = use dram_active_threshold for demote, nvm_promote_threshold for promote
+ * 0 = fall back to 1.B Memtis-original behavior (warm_threshold + PageActive)
+ */
+unsigned int htmm_dual_decision = 1;
 #endif
 
 #ifdef CONFIG_SYSFS
@@ -3656,6 +3661,31 @@ static ssize_t htmm_ts_nvm_ms_store(struct kobject *kobj,
 static struct kobj_attribute htmm_ts_nvm_ms_attr =
 	__ATTR(htmm_ts_nvm_ms, 0644, htmm_ts_nvm_ms_show, htmm_ts_nvm_ms_store);
 
+/* Phase 1.C: A/B switch (1=new dual decision, 0=fallback to 1.B Memtis behavior) */
+static ssize_t htmm_dual_decision_show(struct kobject *kobj,
+				       struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", htmm_dual_decision);
+}
+
+static ssize_t htmm_dual_decision_store(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					const char *buf, size_t count)
+{
+	unsigned int v;
+	int err = kstrtouint(buf, 10, &v);
+	if (err)
+		return err;
+	if (v > 1)
+		return -EINVAL;
+	WRITE_ONCE(htmm_dual_decision, v);
+	return count;
+}
+
+static struct kobj_attribute htmm_dual_decision_attr =
+	__ATTR(htmm_dual_decision, 0644, htmm_dual_decision_show,
+	       htmm_dual_decision_store);
+
 /* Phase 1.B: 只读 dump 第一个 htmm_enabled 的 memcg 的 DRAM/NVM 双 hist
  * + dram_active_threshold + 双 cooling_clock。
  * 实验场景下工作负载跑在 child cgroup，root_mem_cgroup 不开 htmm。
@@ -3666,13 +3696,20 @@ static ssize_t htmm_dump_dual_show(struct kobject *kobj,
 	struct mem_cgroup *iter, *memcg = NULL;
 	int i, len = 0;
 	unsigned long dsum = 0, nsum = 0, hsum = 0;
+	unsigned long best_sum = 0;
 
+	/* 选 hotness_hg 总和最大的 htmm_enabled memcg (真正跑 workload 的那个) */
 	for (iter = mem_cgroup_iter(NULL, NULL, NULL); iter != NULL;
 	     iter = mem_cgroup_iter(NULL, iter, NULL)) {
-		if (iter->htmm_enabled) {
+		unsigned long s = 0;
+		int k;
+		if (!iter->htmm_enabled)
+			continue;
+		for (k = 0; k < 16; k++)
+			s += iter->hotness_hg[k];
+		if (s >= best_sum) {
+			best_sum = s;
 			memcg = iter;
-			mem_cgroup_iter_break(NULL, iter);
-			break;
 		}
 	}
 
@@ -3711,6 +3748,19 @@ static ssize_t htmm_dump_dual_show(struct kobject *kobj,
 		len += scnprintf(buf + len, PAGE_SIZE - len, " %lu",
 				 memcg->nvm_hotness_hg[i]);
 	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	/* Phase 1.C: 决策开关与 promote 端状态 */
+	{
+		unsigned long demote_budget = 0;
+		unsigned int dram_th = memcg->dram_active_threshold;
+		int k;
+		for (k = 0; k < dram_th && k < 16; k++)
+			demote_budget += memcg->dram_hotness_hg[k];
+		len += scnprintf(
+			buf + len, PAGE_SIZE - len,
+			"htmm_dual_decision=%u  nvm_promote_threshold=%u  demote_budget=%lu\n",
+			READ_ONCE(htmm_dual_decision),
+			memcg->nvm_promote_threshold, demote_budget);
+	}
 	spin_unlock(&memcg->access_lock);
 	return len;
 }
@@ -3741,6 +3791,7 @@ static struct attribute *htmm_attrs[] = {
 	&htmm_skip_cooling_attr.attr,
 	&htmm_thres_cooling_alloc_attr.attr,
 	&htmm_dump_dual_attr.attr,
+	&htmm_dual_decision_attr.attr,
 	NULL,
 };
 

@@ -419,15 +419,28 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			goto keep_locked;
 
 		if (htmm_nowarm == 0 && PageAnon(page)) {
+			/* Phase 1.C: \u5207\u6362 demote \u95e8\u69db
+			 *   dual_decision=1 && dram_active_threshold>0:
+			 *     \u7528 dram_active_threshold (DRAM \u5730\u677f\u7ebf)
+			 *   \u5176\u5b83 (cold-start fallback / 1.B \u56de\u9000):
+			 *     \u7528 warm_threshold (Memtis \u539f\u7248)
+			 */
+			unsigned int demote_th;
+			if (READ_ONCE(htmm_dual_decision) &&
+			    memcg->dram_active_threshold > 0)
+				demote_th = memcg->dram_active_threshold;
+			else
+				demote_th = memcg->warm_threshold;
+
 			if (PageTransHuge(page)) {
 				struct page *meta = get_meta_page(page);
 
-				if (meta->idx >= memcg->warm_threshold)
+				if (meta && meta->idx >= demote_th)
 					goto keep_locked;
 			} else {
 				unsigned int idx = get_pginfo_idx(page);
 
-				if (idx >= memcg->warm_threshold)
+				if (idx >= demote_th)
 					goto keep_locked;
 			}
 		}
@@ -451,12 +464,89 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 	return nr_reclaimed;
 }
 
+/*
+ * Phase 1.C helper #1: 算 promote 流量配额。
+ *
+ *   demote_budget = sum(dram_hg[0 .. dram_active_threshold-1])
+ *                   "DRAM 上 idx 在地板线下的页数"（稳态下的 demote 流量）
+ *   free_dram     = max_dram - cur_dram - watermark  (clamp >=0)
+ *                   "DRAM 还能装多少"（cold-start 救场）
+ *   budget        = max(demote_budget, free_dram)
+ *
+ * 稳态:    free_dram=0 → budget=demote_budget → 与 demote 量等量耦合
+ * cold-start: demote_budget=0 → budget=free_dram → 大胆灌满 DRAM
+ */
+static unsigned long __compute_promote_budget(struct mem_cgroup *memcg,
+					      pg_data_t *dram_pgdat)
+{
+	unsigned long demote_budget = 0;
+	unsigned long max_dram, cur_dram, watermark, free_dram = 0;
+	int i;
+	unsigned int dram_th;
+
+	spin_lock(&memcg->access_lock);
+	dram_th = memcg->dram_active_threshold;
+	for (i = 0; i < dram_th && i < 16; i++)
+		demote_budget += memcg->dram_hotness_hg[i];
+	spin_unlock(&memcg->access_lock);
+
+	max_dram = memcg->nodeinfo[dram_pgdat->node_id]->max_nr_base_pages;
+	cur_dram = get_nr_lru_pages_node(memcg, dram_pgdat);
+	if (max_dram != ULONG_MAX) {
+		watermark = get_memcg_promotion_watermark(max_dram);
+		if (max_dram > cur_dram + watermark)
+			free_dram = max_dram - cur_dram - watermark;
+	}
+
+	return max(demote_budget, free_dram);
+}
+
+/*
+ * Phase 1.C helper #2: 由 promote_budget 反推 NVM 侧"够热"门槛。
+ * 从 nvm_hg[15] 往下累加直到 sum >= budget，break 时 i 即门槛。
+ *
+ *   budget=0  → 返回 16  (谁都不该 promote)
+ *   极冷场景  → htmm_thres_hot 兜底 (避免算到 0 把 NVM 全 promote)
+ */
+static unsigned int __compute_nvm_promote_threshold(struct mem_cgroup *memcg,
+						    unsigned long budget)
+{
+	unsigned long sum = 0;
+	int i;
+
+	if (budget == 0)
+		return 16;
+
+	spin_lock(&memcg->access_lock);
+	for (i = 15; i >= 0; i--) {
+		sum += memcg->nvm_hotness_hg[i];
+		if (sum >= budget)
+			break;
+	}
+	spin_unlock(&memcg->access_lock);
+
+	if (i < 0)
+		i = 0;
+	if ((unsigned int)i < htmm_thres_hot)
+		i = htmm_thres_hot;
+	return (unsigned int)i;
+}
+
+/*
+ * Phase 1.C: promote_page_list 增 (memcg, nr_to_promote) 形参。
+ *   htmm_dual_decision=1: idx >= nvm_promote_threshold && cand < budget 才 promote
+ *   htmm_dual_decision=0: 1.B 回退，原 PageActive 路径
+ */
 static unsigned long promote_page_list(struct list_head *page_list,
-				       pg_data_t *pgdat)
+				       pg_data_t *pgdat,
+				       struct mem_cgroup *memcg,
+				       unsigned long nr_to_promote)
 {
 	LIST_HEAD(promote_pages);
 	LIST_HEAD(ret_pages);
 	unsigned long nr_promoted = 0;
+	unsigned long nr_promote_cand = 0;
+	bool dual = READ_ONCE(htmm_dual_decision);
 
 	cond_resched();
 
@@ -468,8 +558,24 @@ static unsigned long promote_page_list(struct list_head *page_list,
 
 		if (!trylock_page(page))
 			goto __keep;
-		if (!PageActive(page) && htmm_mode != HTMM_NO_MIG)
-			goto __keep_locked;
+
+		if (dual && memcg) {
+			unsigned int idx;
+			if (PageTransHuge(page)) {
+				struct page *meta = get_meta_page(page);
+				idx = meta ? meta->idx : 0;
+			} else {
+				idx = get_pginfo_idx(page);
+			}
+			if (idx < memcg->nvm_promote_threshold)
+				goto __keep_locked;
+			if (nr_promote_cand >= nr_to_promote)
+				goto __keep_locked;
+		} else {
+			if (!PageActive(page) && htmm_mode != HTMM_NO_MIG)
+				goto __keep_locked;
+		}
+
 		if (unlikely(!page_evictable(page)))
 			goto __keep_locked;
 		if (PageWriteback(page))
@@ -478,6 +584,7 @@ static unsigned long promote_page_list(struct list_head *page_list,
 			goto __keep_locked;
 
 		list_add(&page->lru, &promote_pages);
+		nr_promote_cand += compound_nr(page);
 		unlock_page(page);
 		continue;
 	__keep_locked:
@@ -531,7 +638,8 @@ static unsigned long demote_inactive_list(unsigned long nr_to_scan,
 
 static unsigned long promote_active_list(unsigned long nr_to_scan,
 					 struct lruvec *lruvec,
-					 enum lru_list lru)
+					 enum lru_list lru,
+					 unsigned long nr_to_promote)
 {
 	LIST_HEAD(page_list);
 	pg_data_t *pgdat = lruvec_pgdat(lruvec);
@@ -547,7 +655,8 @@ static unsigned long promote_active_list(unsigned long nr_to_scan,
 	if (nr_taken == 0)
 		return 0;
 
-	nr_promoted = promote_page_list(&page_list, pgdat);
+	nr_promoted = promote_page_list(&page_list, pgdat, lruvec_memcg(lruvec),
+					nr_to_promote);
 
 	spin_lock_irq(&lruvec->lru_lock);
 	move_pages_to_lru(lruvec, &page_list);
@@ -616,7 +725,8 @@ static unsigned long promote_lruvec(unsigned long nr_to_promote, short priority,
 
 	nr = nr_to_promote >> priority;
 	if (nr)
-		nr_promoted += promote_active_list(nr, lruvec, lru);
+		nr_promoted +=
+			promote_active_list(nr, lruvec, lru, nr_to_promote);
 
 	return nr_promoted;
 }
@@ -684,7 +794,8 @@ static unsigned long demote_node(pg_data_t *pgdat, struct mem_cgroup *memcg,
 	return nr_reclaimed;
 }
 
-static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg)
+static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg,
+				  unsigned long budget)
 {
 	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 	unsigned long nr_to_promote, nr_promoted = 0, tmp;
@@ -698,6 +809,10 @@ static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg)
 
 	nr_to_promote =
 		min(nr_to_promote, lruvec_lru_size(lruvec, lru, MAX_NR_ZONES));
+
+	/* Phase 1.C: 配额闸。budget=0 表示不限制（1.B 回退路径） */
+	if (budget > 0)
+		nr_to_promote = min(nr_to_promote, budget);
 
 	if (nr_to_promote == 0 && htmm_mode == HTMM_NO_MIG) {
 		lru = LRU_INACTIVE_ANON;
@@ -1140,11 +1255,31 @@ static int kmigraterd_promotion(pg_data_t *pgdat)
 
 		/* promotes hot pages to fast memory node */
 		if (need_lowertier_promotion(pgdat, memcg)) {
-			unsigned long __nr_promoted =
-				promote_node(pgdat, memcg);
+			unsigned long budget = 0;
+			unsigned long __nr_promoted;
+
+			if (READ_ONCE(htmm_dual_decision)) {
+				int dram_nid = htmm_cxl_mode ?
+						       0 :
+						       next_promotion_node(
+							       pgdat->node_id);
+				if (dram_nid != NUMA_NO_NODE) {
+					pg_data_t *dram_pgdat =
+						NODE_DATA(dram_nid);
+					budget = __compute_promote_budget(
+						memcg, dram_pgdat);
+					memcg->nvm_promote_threshold =
+						__compute_nvm_promote_threshold(
+							memcg, budget);
+				}
+			}
+
+			__nr_promoted = promote_node(pgdat, memcg, budget);
 			trace_printk(
-				"[PROMOTE] ts=%llu nr_promoted=%lu active_thres=%u\n",
-				ktime_get_real_seconds(), __nr_promoted,
+				"[PROMOTE] ts=%llu nr_promoted=%lu budget=%lu nvm_th=%u dram_th=%u active_thres=%u\n",
+				ktime_get_real_seconds(), __nr_promoted, budget,
+				memcg->nvm_promote_threshold,
+				memcg->dram_active_threshold,
 				memcg->active_threshold);
 		}
 

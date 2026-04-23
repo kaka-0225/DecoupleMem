@@ -394,6 +394,8 @@ struct mem_cgroup {
 	unsigned long dram_hotness_hg[16];
 	unsigned long nvm_hotness_hg[16];
 	unsigned int dram_active_threshold;
+	/* Phase 1.C: NVM-side promote threshold (top-N by nvm_hotness_hg) */
+	unsigned int nvm_promote_threshold;
 	/* lock for histogram */
 	spinlock_t access_lock;
 	/* etc */
