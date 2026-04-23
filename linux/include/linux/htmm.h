@@ -100,6 +100,12 @@ extern void clear_transhuge_pginfo(struct page *page);
 extern void copy_transhuge_pginfo(struct page *page, struct page *newpage);
 extern pginfo_t *get_compound_pginfo(struct page *page, unsigned long address);
 
+/* Phase 1.D: 判断本次迁移落点是 demote (DRAM->NVM) 还是 promote (->DRAM)。
+ * 仅按 newpage 的 nid 判定，不依赖调用方传入方向参数，故能挂在 EXPORT_SYMBOL
+ * 的迁移路径上而不破坏 ABI。
+ */
+extern bool htmm_migrate_is_demote(struct page *new);
+
 extern void check_transhuge_cooling(void *arg, struct page *page, bool locked);
 extern void check_base_cooling(pginfo_t *pginfo, struct page *page,
 			       bool locked);

@@ -100,10 +100,23 @@ void clear_transhuge_pginfo(struct page *page)
 	set_page_private(page, 0);
 }
 
+/*
+ * Phase 1.D helper: 判断本次迁移落点是否在 NVM (即 demote 完成态)。
+ *   htmm_cxl_mode: nid==0 才是 DRAM
+ *   非 cxl: node_is_toptier(nid) 才是 DRAM
+ */
+bool htmm_migrate_is_demote(struct page *new)
+{
+	int nid = page_to_nid(new);
+	return htmm_cxl_mode ? (nid != 0) : !node_is_toptier(nid);
+}
+
 void copy_transhuge_pginfo(struct page *page, struct page *newpage)
 {
 	int i, idx, offset;
 	pginfo_t zero_pginfo = { 0 };
+	struct mem_cgroup *memcg;
+	bool is_demote;
 
 	VM_BUG_ON_PAGE(!PageCompound(page), page);
 	VM_BUG_ON_PAGE(!PageCompound(newpage), newpage);
@@ -114,11 +127,19 @@ void copy_transhuge_pginfo(struct page *page, struct page *newpage)
 	if (!PageHtmm(&page[3]))
 		return;
 
+	/* Phase 1.D: 仅当 htmm_dual_decision=1 且 memcg 启用 htmm 且方向是
+	 * demote 时, 走"清零 newpage"路径; 否则保持原"复制"行为, 等同 1.C。
+	 */
+	memcg = page_memcg(page);
+	is_demote = (READ_ONCE(htmm_dual_decision) && memcg &&
+		     memcg->htmm_enabled && htmm_migrate_is_demote(newpage));
+
 	newpage[3].hot_utils = page[3].hot_utils;
-	newpage[3].total_accesses = page[3].total_accesses;
+	newpage[3].total_accesses = is_demote ? 0 : page[3].total_accesses;
 	newpage[3].skewness_idx = page[3].skewness_idx;
-	newpage[3].cooling_clock = page[3].cooling_clock;
-	newpage[3].idx = page[3].idx;
+	newpage[3].cooling_clock = (is_demote && memcg) ? memcg->cooling_clock :
+							  page[3].cooling_clock;
+	newpage[3].idx = is_demote ? 0 : page[3].idx;
 
 	SetPageHtmm(&newpage[3]);
 
@@ -126,10 +147,14 @@ void copy_transhuge_pginfo(struct page *page, struct page *newpage)
 		idx = 4 + i / 4;
 		offset = i % 4;
 
-		newpage[idx].compound_pginfo[offset].nr_accesses =
-			page[idx].compound_pginfo[offset].nr_accesses;
-		newpage[idx].compound_pginfo[offset].total_accesses =
-			page[idx].compound_pginfo[offset].total_accesses;
+		if (is_demote) {
+			newpage[idx].compound_pginfo[offset] = zero_pginfo;
+		} else {
+			newpage[idx].compound_pginfo[offset].nr_accesses =
+				page[idx].compound_pginfo[offset].nr_accesses;
+			newpage[idx].compound_pginfo[offset].total_accesses =
+				page[idx].compound_pginfo[offset].total_accesses;
+		}
 
 		page[idx].compound_pginfo[offset] = zero_pginfo;
 		page[idx].mapping = TAIL_MAPPING;
