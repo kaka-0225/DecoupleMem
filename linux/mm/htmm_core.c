@@ -173,6 +173,71 @@ pginfo_t *get_compound_pginfo(struct page *page, unsigned long address)
 	return &(page[idx].compound_pginfo[offset]);
 }
 
+/*
+ * Phase 1.E.collapse: 把 khugepaged 在 __collapse_huge_page_copy 阶段
+ * 从 src PTE pginfo 中暂存好的 32 项 stash[], 写入新分配 THP 的
+ * compound_pginfo[] 与 meta page (page[3])。
+ *
+ * 调用前提:
+ *   - new_page 已经过 prep_transhuge_page (设置过 page[3] 默认 hotness_factor)
+ *   - 必须在 __SetPageUptodate(new_page) 之前调用
+ *   - stash[] 长度 == HPAGE_PMD_NR; 调用方负责清零未被填充的槽
+ *
+ * 聚合策略:
+ *   - per-sub 字段 (nr_accesses/total_accesses/cooling_clock/may_hot) 1:1 复制
+ *   - meta page total_accesses = 32 个 sub 的算术平均, 防止单热子页污染整 THP
+ *   - meta page hot_utils = 任一 sub may_hot 为真则置 1
+ *   - meta page cooling_clock = 当前 memcg cooling_clock (拉齐时间基线)
+ *   - meta page idx 强制重算为 0, 让下次 cooling 自然推进
+ *
+ * 受 htmm_dual_decision 闸门保护; =0 时直接返回, 沿用上游默认 hotness_factor。
+ */
+void htmm_apply_collapsed_pginfo(struct page *new_page, pginfo_t *stash,
+				 unsigned int nr)
+{
+	struct mem_cgroup *memcg;
+	unsigned long sum_total = 0;
+	unsigned int any_hot = 0;
+	int i, idx, offset;
+
+	if (!new_page || !stash || nr == 0)
+		return;
+	if (!READ_ONCE(htmm_dual_decision))
+		return;
+
+	new_page = compound_head(new_page);
+	if (!PageHtmm(&new_page[3]))
+		return;
+
+	memcg = page_memcg(new_page);
+	if (!memcg || !memcg->htmm_enabled)
+		return;
+
+	for (i = 0; i < HPAGE_PMD_NR && i < nr; i++) {
+		idx = 4 + i / 4;
+		offset = i % 4;
+
+		new_page[idx].compound_pginfo[offset].nr_accesses =
+			stash[i].nr_accesses;
+		new_page[idx].compound_pginfo[offset].total_accesses =
+			stash[i].total_accesses;
+		new_page[idx].compound_pginfo[offset].cooling_clock =
+			stash[i].cooling_clock;
+		new_page[idx].compound_pginfo[offset].may_hot =
+			stash[i].may_hot;
+
+		sum_total += stash[i].total_accesses;
+		if (stash[i].may_hot)
+			any_hot = 1;
+	}
+
+	new_page[3].total_accesses = sum_total / HPAGE_PMD_NR;
+	new_page[3].hot_utils = any_hot;
+	new_page[3].idx = 0;
+	new_page[3].cooling_clock = memcg->cooling_clock;
+}
+EXPORT_SYMBOL(htmm_apply_collapsed_pginfo);
+
 void check_transhuge_cooling(void *arg, struct page *page, bool locked)
 {
 	struct mem_cgroup *memcg =

@@ -106,6 +106,13 @@ extern pginfo_t *get_compound_pginfo(struct page *page, unsigned long address);
  */
 extern bool htmm_migrate_is_demote(struct page *new);
 
+/* Phase 1.E.collapse: 把 khugepaged 暂存好的 32 项 sub-page pginfo
+ * 写入新分配 THP 的 compound_pginfo[] 与 meta page。
+ * 调用方必须在 prep_transhuge_page 之后、__SetPageUptodate 之前调用。
+ */
+extern void htmm_apply_collapsed_pginfo(struct page *new_page, pginfo_t *stash,
+					unsigned int nr);
+
 extern void check_transhuge_cooling(void *arg, struct page *page, bool locked);
 extern void check_base_cooling(pginfo_t *pginfo, struct page *page,
 			       bool locked);
