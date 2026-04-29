@@ -419,18 +419,24 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			goto keep_locked;
 
 		if (htmm_nowarm == 0 && PageAnon(page)) {
-			/* Phase 1.C: \u5207\u6362 demote \u95e8\u69db
+			/* Phase 1.C: 切换 demote 门槛
 			 *   dual_decision=1 && dram_active_threshold>0:
-			 *     \u7528 dram_active_threshold (DRAM \u5730\u677f\u7ebf)
-			 *   \u5176\u5b83 (cold-start fallback / 1.B \u56de\u9000):
-			 *     \u7528 warm_threshold (Memtis \u539f\u7248)
+			 *     用 dram_active_threshold (DRAM 地板线)
+			 *   dual_decision=1 && dram_active_threshold==0 (cold-start):
+			 *     用 16 不过滤，让 inactive 页自由下沉腾 DRAM 空间
+			 *     等 __adjust_dram_active_threshold 算出非零值后切回
+			 *   其它 (1.B 回退):
+			 *     用 warm_threshold (Memtis 原版)
 			 */
 			unsigned int demote_th;
-			if (READ_ONCE(htmm_dual_decision) &&
-			    memcg->dram_active_threshold > 0)
-				demote_th = memcg->dram_active_threshold;
-			else
+			if (READ_ONCE(htmm_dual_decision)) {
+				demote_th =
+					memcg->dram_active_threshold > 0 ?
+						memcg->dram_active_threshold :
+						16; /* cold-start: no filter */
+			} else {
 				demote_th = memcg->warm_threshold;
+			}
 
 			if (PageTransHuge(page)) {
 				struct page *meta = get_meta_page(page);
@@ -514,8 +520,14 @@ static unsigned int __compute_nvm_promote_threshold(struct mem_cgroup *memcg,
 	unsigned long sum = 0;
 	int i;
 
-	if (budget == 0)
-		return 16;
+	if (budget == 0) {
+		/* Phase 1.E: even with zero budget, keep threshold at floor
+		 * (promotion is still blocked by nr_to_promote=0 budget check,
+		 *  but the stored value stays sensible across cooling resets) */
+		unsigned int floor =
+			max(htmm_thres_hot, READ_ONCE(htmm_min_nvm_promote_th));
+		return floor ? floor : 16;
+	}
 
 	spin_lock(&memcg->access_lock);
 	for (i = 15; i >= 0; i--) {
@@ -527,8 +539,18 @@ static unsigned int __compute_nvm_promote_threshold(struct mem_cgroup *memcg,
 
 	if (i < 0)
 		i = 0;
-	if ((unsigned int)i < htmm_thres_hot)
-		i = htmm_thres_hot;
+	/* Phase 1.E: floor = max(htmm_thres_hot, htmm_min_nvm_promote_th)
+	 * Filters out transient (touched-once/twice) NVM pages whose bin index
+	 * is below the floor, even if budget would otherwise admit them.
+	 */
+	{
+		unsigned int floor = htmm_thres_hot;
+		unsigned int user_floor = READ_ONCE(htmm_min_nvm_promote_th);
+		if (user_floor > floor)
+			floor = user_floor;
+		if ((unsigned int)i < floor)
+			i = floor;
+	}
 	return (unsigned int)i;
 }
 
@@ -618,6 +640,9 @@ static unsigned long demote_inactive_list(unsigned long nr_to_scan,
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	trace_printk("[DISO] lru=%d nr_to_scan=%lu nr_taken=%lu\n", (int)lru,
+		     nr_to_scan, nr_taken);
+
 	if (nr_taken == 0) {
 		return 0;
 	}
@@ -676,20 +701,26 @@ static unsigned long demote_lruvec(unsigned long nr_to_reclaim, short priority,
 	enum lru_list lru, tmp;
 	unsigned long nr_reclaimed = 0;
 	long nr_to_scan;
+	unsigned long lru_size_dbg;
 
 	/* we need to scan file lrus first */
 	for_each_evictable_lru (tmp) {
+		unsigned long reclaimed_before = nr_reclaimed;
 		lru = (tmp + 2) % 4;
 
-		if (!shrink_active && !is_file_lru(lru) && is_active_lru(lru))
+		if (!shrink_active && !is_file_lru(lru) && is_active_lru(lru)) {
+			trace_printk(
+				"[DLRU] lru=%d SKIP_active shrink_active=0 size=%lu\n",
+				(int)lru,
+				lruvec_lru_size(lruvec, lru, MAX_NR_ZONES));
 			continue;
+		}
 
+		lru_size_dbg = lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
 		if (is_file_lru(lru)) {
-			nr_to_scan = lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
+			nr_to_scan = lru_size_dbg;
 		} else {
-			nr_to_scan =
-				lruvec_lru_size(lruvec, lru, MAX_NR_ZONES) >>
-				priority;
+			nr_to_scan = lru_size_dbg >> priority;
 
 			if (nr_to_scan < nr_to_reclaim)
 				nr_to_scan =
@@ -697,8 +728,12 @@ static unsigned long demote_lruvec(unsigned long nr_to_reclaim, short priority,
 					10; // because warm pages are not demoted
 		}
 
-		if (!nr_to_scan)
+		if (!nr_to_scan) {
+			trace_printk(
+				"[DLRU] lru=%d nr_to_scan=0 lru_size=%lu prio=%d skip\n",
+				(int)lru, lru_size_dbg, (int)priority);
 			continue;
+		}
 
 		while (nr_to_scan > 0) {
 			unsigned long scan = min_t(unsigned long, nr_to_scan,
@@ -709,6 +744,11 @@ static unsigned long demote_lruvec(unsigned long nr_to_reclaim, short priority,
 			if (nr_reclaimed >= nr_to_reclaim)
 				break;
 		}
+
+		trace_printk(
+			"[DLRU] lru=%d lru_size=%lu nr_to_reclaim=%lu reclaimed=%lu prio=%d\n",
+			(int)lru, lru_size_dbg, nr_to_reclaim,
+			nr_reclaimed - reclaimed_before, (int)priority);
 
 		if (nr_reclaimed >= nr_to_reclaim)
 			break;
@@ -799,12 +839,21 @@ static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg,
 {
 	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 	unsigned long nr_to_promote, nr_promoted = 0, tmp;
+	unsigned long lru_aanon, lru_ianon;
 	enum lru_list lru = LRU_ACTIVE_ANON;
 	short priority = DEF_PRIORITY;
 	int target_nid =
 		htmm_cxl_mode ? 0 : next_promotion_node(pgdat->node_id);
+	bool avail;
 
-	if (!promotion_available(target_nid, memcg, &nr_to_promote))
+	lru_aanon = lruvec_lru_size(lruvec, LRU_ACTIVE_ANON, MAX_NR_ZONES);
+	lru_ianon = lruvec_lru_size(lruvec, LRU_INACTIVE_ANON, MAX_NR_ZONES);
+	avail = promotion_available(target_nid, memcg, &nr_to_promote);
+	trace_printk(
+		"[PRMA] avail=%d nr_to_promote=%lu budget=%lu lru_aanon=%lu lru_ianon=%lu\n",
+		avail ? 1 : 0, avail ? nr_to_promote : 0UL, budget, lru_aanon,
+		lru_ianon);
+	if (!avail)
 		return 0;
 
 	nr_to_promote =
@@ -916,6 +965,18 @@ static unsigned long cooling_active_list(unsigned long nr_to_scan,
 		ClearPageActive(page);
 		SetPageWorkingset(page);
 		list_add(&page->lru, &l_inactive);
+	}
+
+	{
+		struct list_head *_p;
+		unsigned long _nr_active = 0, _nr_inactive = 0;
+		list_for_each (_p, &l_active)
+			_nr_active++;
+		list_for_each (_p, &l_inactive)
+			_nr_inactive++;
+		trace_printk(
+			"[COOL_ACT] lru=%d nr_taken=%lu kept_active=%lu moved_inactive=%lu\n",
+			(int)lru, nr_taken, _nr_active, _nr_inactive);
 	}
 
 	spin_lock_irq(&lruvec->lru_lock);
@@ -1176,13 +1237,24 @@ static int kmigraterd_demotion(pg_data_t *pgdat)
 
 		/* demotes inactive lru pages */
 		if (need_toptier_demotion(pgdat, memcg, &nr_exceeded)) {
+			struct lruvec *_lv = mem_cgroup_lruvec(memcg, pgdat);
+			unsigned long _aanon = lruvec_lru_size(
+				_lv, LRU_ACTIVE_ANON, MAX_NR_ZONES);
+			unsigned long _ianon = lruvec_lru_size(
+				_lv, LRU_INACTIVE_ANON, MAX_NR_ZONES);
+			unsigned long _cur =
+				get_nr_lru_pages_node(memcg, pgdat);
+			unsigned long _max = memcg->nodeinfo[pgdat->node_id]
+						     ->max_nr_base_pages;
 			unsigned long __nr_demoted =
 				demote_node(pgdat, memcg, nr_exceeded);
 			trace_printk(
-				"[DEMOTE] ts=%llu nr_demoted=%lu nr_exceeded=%lu active_thres=%u warm_thres=%u\n",
+				"[DEMOTE] ts=%llu nr_demoted=%lu nr_exceeded=%lu active_thres=%u warm_thres=%u dram_at=%u lru_aanon=%lu lru_ianon=%lu cur_dram=%lu max_dram=%lu\n",
 				ktime_get_real_seconds(), __nr_demoted,
 				nr_exceeded, memcg->active_threshold,
-				memcg->warm_threshold);
+				memcg->warm_threshold,
+				memcg->dram_active_threshold, _aanon, _ianon,
+				_cur, _max);
 		}
 		//if (need_direct_demotion(pgdat, memcg))
 		//  goto demotion;

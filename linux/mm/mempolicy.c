@@ -3049,6 +3049,12 @@ unsigned int htmm_ts_nvm_ms = 40; /* TS NVM phase length in ms */
  * 0 = fall back to 1.B Memtis-original behavior (warm_threshold + PageActive)
  */
 unsigned int htmm_dual_decision = 1;
+/* Phase 1.E: floor for auto-derived nvm_promote_threshold.
+ * 0 = disabled (current behavior, only htmm_thres_hot floor applies).
+ * Recommend 6 to filter out transient (touched-once/twice) NVM pages
+ * on workloads with very flat NVM histograms (e.g. graph500 BFS).
+ */
+unsigned int htmm_min_nvm_promote_th = 6;
 #endif
 
 #ifdef CONFIG_SYSFS
@@ -3686,6 +3692,32 @@ static struct kobj_attribute htmm_dual_decision_attr =
 	__ATTR(htmm_dual_decision, 0644, htmm_dual_decision_show,
 	       htmm_dual_decision_store);
 
+/* Phase 1.E: minimum floor for nvm_promote_threshold (0..15). */
+static ssize_t htmm_min_nvm_promote_th_show(struct kobject *kobj,
+					    struct kobj_attribute *attr,
+					    char *buf)
+{
+	return sysfs_emit(buf, "%u\n", htmm_min_nvm_promote_th);
+}
+
+static ssize_t htmm_min_nvm_promote_th_store(struct kobject *kobj,
+					     struct kobj_attribute *attr,
+					     const char *buf, size_t count)
+{
+	unsigned int v;
+	int err = kstrtouint(buf, 10, &v);
+	if (err)
+		return err;
+	if (v > 15)
+		return -EINVAL;
+	WRITE_ONCE(htmm_min_nvm_promote_th, v);
+	return count;
+}
+
+static struct kobj_attribute htmm_min_nvm_promote_th_attr =
+	__ATTR(htmm_min_nvm_promote_th, 0644, htmm_min_nvm_promote_th_show,
+	       htmm_min_nvm_promote_th_store);
+
 /* Phase 1.B: 只读 dump 第一个 htmm_enabled 的 memcg 的 DRAM/NVM 双 hist
  * + dram_active_threshold + 双 cooling_clock。
  * 实验场景下工作负载跑在 child cgroup，root_mem_cgroup 不开 htmm。
@@ -3792,6 +3824,7 @@ static struct attribute *htmm_attrs[] = {
 	&htmm_thres_cooling_alloc_attr.attr,
 	&htmm_dump_dual_attr.attr,
 	&htmm_dual_decision_attr.attr,
+	&htmm_min_nvm_promote_th_attr.attr,
 	NULL,
 };
 
