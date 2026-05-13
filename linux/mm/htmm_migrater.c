@@ -423,8 +423,9 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			 *   dual_decision=1 && dram_active_threshold>0:
 			 *     用 dram_active_threshold (DRAM 地板线)
 			 *   dual_decision=1 && dram_active_threshold==0 (cold-start):
-			 *     用 16 不过滤，让 inactive 页自由下沉腾 DRAM 空间
-			 *     等 __adjust_dram_active_threshold 算出非零值后切回
+			 *     用 active_threshold+1 (比活跃门槛宽 1 bin)
+			 *     既能腾出 DRAM (放 idx==active_thres 的普通活跃页下沉)
+			 *     又保护真热页 (idx >= active_thres+1)
 			 *   其它 (1.B 回退):
 			 *     用 warm_threshold (Memtis 原版)
 			 */
@@ -433,7 +434,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 				demote_th =
 					memcg->dram_active_threshold > 0 ?
 						memcg->dram_active_threshold :
-						16; /* cold-start: no filter */
+						memcg->active_threshold + 1;
 			} else {
 				demote_th = memcg->warm_threshold;
 			}
